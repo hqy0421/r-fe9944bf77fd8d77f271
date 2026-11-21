@@ -7,6 +7,7 @@ This module contains utility functions.
 """
 
 import enum
+import json
 import re
 from collections import defaultdict
 from collections.abc import Sequence
@@ -19,6 +20,7 @@ from typing import (
     Callable,
     Dict,
     Iterable,
+    Iterator,
     List,
     Mapping,
     Optional,
@@ -721,6 +723,178 @@ def cell_list_to_rect(cell_list: List["Cell"]) -> List[List[Optional[str]]]:
     # of updates, so if a cell isn't present in the input cell_list, then the
     # value will be None and will not be updated.
     return [[rows[i].get(j) for j in rect_cols] for i in rect_rows]
+
+
+def compact_json_dumps(obj: Any) -> str:
+    """Serialize *obj* to a compact JSON string.
+
+    No whitespace is inserted between tokens and non-ASCII characters are
+    kept as-is (so they take their plain UTF-8 encoding, not ``\\uXXXX``
+    escapes).
+    """
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def cell_list_to_row_map(cell_list: List["Cell"]) -> Dict[int, Dict[int, Any]]:
+    """Group the cells of *cell_list* by row, then by column.
+
+    Returns a dict ``{row: {col: value}}``. When several cells share the
+    same coordinates, the last value wins.
+    """
+    rows: Dict[int, Dict[int, Any]] = {}
+    for cell in cell_list:
+        rows.setdefault(cell.row, {})[cell.col] = cell.value
+    return rows
+
+
+#: Byte length of a JSON ``null`` literal, used for skipped cells.
+_JSON_NULL_BYTES = len("null")
+
+#: Byte length of the fixed parts of one ``ValueRange`` object in a
+#: ``values.batchUpdate`` request body serialized with :func:`compact_json_dumps`:
+#: ``{"range":"`` + ``","values":[`` + ``]}``.
+_VALUE_RANGE_FIXED_BYTES = len('{"range":"') + len('","values":[') + len("]}")
+
+
+def _column_label_length(col: int) -> int:
+    """Number of characters of the A1 column label of *col*.
+
+    Mirrors the conversion done by :func:`rowcol_to_a1` without building
+    the label.
+    """
+    length = 0
+    while col:
+        col, mod = divmod(col, 26)
+        if mod == 0:
+            col -= 1
+        length += 1
+    return length
+
+
+def _row_base_bytes(row_cells: Mapping[int, Any]) -> int:
+    """Byte contribution of one row's values, relative to ``null`` elements.
+
+    A present value costs its own compact JSON encoding instead of ``null``.
+    """
+    return sum(
+        len(compact_json_dumps(value).encode("utf-8")) - _JSON_NULL_BYTES
+        for value in row_cells.values()
+    )
+
+
+def _suffix_optima(
+    n: int, iter_blocks: Callable[[int], Iterator[Tuple[int, int, int, int]]]
+) -> List[Tuple[int, int]]:
+    """Best (bytes, blocks) achievable to cover rows[s:], for every s.
+
+    *iter_blocks(start)* yields ``(end, min_col, max_col, cost)`` for every
+    candidate block covering rows[start..end], where *cost* includes the
+    block's leading "," separator unless *start* is 0.
+    """
+    tail: List[Tuple[int, int]] = [(1 << 62, 1 << 62)] * (n + 1)
+    tail[n] = (0, 0)
+    for start in range(n - 1, -1, -1):
+        for end, _, _, cost in iter_blocks(start):
+            candidate = (cost + tail[end + 1][0], 1 + tail[end + 1][1])
+            if candidate < tail[start]:
+                tail[start] = candidate
+    return tail
+
+
+def _earliest_optimal_split(
+    n: int,
+    rows: List[int],
+    iter_blocks: Callable[[int], Iterator[Tuple[int, int, int, int]]],
+    tail: List[Tuple[int, int]],
+) -> List[Tuple[int, int, int, int]]:
+    """Rebuild an optimal split, taking the earliest cut point on ties."""
+    blocks = []
+    start = 0
+    while start < n:
+        for end, min_col, max_col, cost in iter_blocks(start):
+            candidate = (cost + tail[end + 1][0], 1 + tail[end + 1][1])
+            if candidate == tail[start]:
+                blocks.append((rows[start], min_col, rows[end], max_col))
+                start = end + 1
+                break
+    return blocks
+
+
+def optimal_update_blocks(
+    row_map: Mapping[int, Mapping[int, Any]],
+    range_prefix: str,
+) -> List[Tuple[int, int, int, int]]:
+    """Split cells into contiguous row blocks of minimal total request size.
+
+    Given *row_map* as returned by :func:`cell_list_to_row_map`, split the
+    involved rows, from top to bottom, into contiguous blocks (a row is
+    never split across blocks). Each block is sent as one ``ValueRange``
+    holding the block's minimal bounding rectangle, so the split determines
+    the size of the whole ``values.batchUpdate`` request body.
+
+    Returns the list of blocks as ``(start_row, start_col, end_row,
+    end_col)`` tuples (1-based, inclusive) minimizing the UTF-8 byte length
+    of the request body serialized with :func:`compact_json_dumps`. Ties are
+    broken by preferring fewer blocks, then earlier cut points.
+
+    *range_prefix* is the absolute sheet name prefix of the range labels,
+    e.g. ``"'Sheet 1'!"``; only its UTF-8 length influences the result.
+
+    The split is computed from per-row aggregates only: candidate bounding
+    rectangles are never expanded into value grids.
+
+    .. versionadded:: 6.3.0
+    """
+    rows = sorted(row_map)
+    n = len(rows)
+    if n == 0:
+        return []
+
+    min_cols = [min(row_map[row]) for row in rows]
+    max_cols = [max(row_map[row]) for row in rows]
+    base_bytes = [_row_base_bytes(row_map[row]) for row in rows]
+    prefix_bytes = len(range_prefix.encode("utf-8"))
+    row_label_bytes = [len(str(row)) for row in rows]
+
+    def block_bytes(start: int, end: int, min_col: int, max_col: int, base: int) -> int:
+        """Exact UTF-8 length of the ValueRange covering rows[start..end].
+
+        Accounts for ``{"range":"<prefix><A1>:<A1>","values":[<row arrays>]}``
+        where every row of the bounding rectangle (including rows without
+        cells) is a JSON array of *width* elements, each stored value or
+        ``null``.
+        """
+        width = max_col - min_col + 1
+        height = rows[end] - rows[start] + 1
+        range_bytes = (
+            prefix_bytes
+            + _column_label_length(min_col)
+            + row_label_bytes[start]
+            + 1  # ":" between the range ends
+            + _column_label_length(max_col)
+            + row_label_bytes[end]
+        )
+        # Each of the `height` row arrays costs 5*width+1 bytes (brackets,
+        # commas and `null` elements) plus the stored values' extra bytes;
+        # row arrays are joined by `height - 1` commas.
+        values_bytes = base + height * (5 * width + 1) + (height - 1)
+        return _VALUE_RANGE_FIXED_BYTES + range_bytes + values_bytes
+
+    def iter_blocks(start: int) -> Iterator[Tuple[int, int, int, int]]:
+        """Yield (end, min_col, max_col, cost) for blocks rows[start..end]."""
+        separator = 0 if start == 0 else 1
+        min_col = min_cols[start]
+        max_col = max_cols[start]
+        base = 0
+        for end in range(start, n):
+            min_col = min(min_col, min_cols[end])
+            max_col = max(max_col, max_cols[end])
+            base += base_bytes[end]
+            cost = separator + block_bytes(start, end, min_col, max_col, base)
+            yield end, min_col, max_col, cost
+
+    tail = _suffix_optima(n, iter_blocks)
+    return _earliest_optimal_split(n, rows, iter_blocks, tail)
 
 
 def quote(value: str, safe: str = "", encoding: str = "utf-8") -> str:

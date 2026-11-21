@@ -290,6 +290,23 @@ class HTTPClient:
         r = self.request("post", url, json=body, default_serializer=default_serializer)
         return r.json()
 
+    def values_batch_update_bytes(self, id: str, payload: bytes) -> Any:
+        """Lower-level method that directly calls `spreadsheets/<ID>/values:batchUpdate <https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets.values/batchUpdate>`_
+        with a pre-serialized request body.
+
+        :param bytes payload: The exact request body to send, as UTF-8
+            encoded JSON. It is sent verbatim, in a single request.
+        :returns: `Values Batch Update Response body <https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets.values/batchUpdate#response-body>`_.
+        :rtype: dict
+
+        .. versionadded:: 6.3.0
+        """
+        url = SPREADSHEET_VALUES_BATCH_UPDATE_URL % id
+        r = self.request(
+            "post", url, data=payload, headers={"Content-Type": "application/json"}
+        )
+        return r.json()
+
     def spreadsheets_get(self, id: str, params: Optional[ParamsType] = None) -> Any:
         """A method stub that directly calls `spreadsheets.get <https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets/get>`_."""
         url = SPREADSHEET_URL % id

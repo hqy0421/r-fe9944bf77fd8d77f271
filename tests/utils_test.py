@@ -690,3 +690,184 @@ class UtilsTest(unittest.TestCase):
         table = utils.find_table(values, "A1", utils.TableDirection.table)
 
         self.assertListEqual(table, [], "resulting table should be empty")
+
+
+class CompactJsonDumpsTest(unittest.TestCase):
+    def test_compact_separators(self):
+        self.assertEqual(
+            utils.compact_json_dumps({"a": [1, None, "x"], "b": {"c": 2}}),
+            '{"a":[1,null,"x"],"b":{"c":2}}',
+        )
+
+    def test_non_ascii_kept_as_utf8(self):
+        self.assertEqual(utils.compact_json_dumps("日本語"), '"日本語"')
+        self.assertEqual(
+            len(utils.compact_json_dumps("日本語").encode("utf-8")),
+            2 + 3 * 3,  # quotes + 3 chars * 3 bytes
+        )
+
+
+class CellListToRowMapTest(unittest.TestCase):
+    def test_groups_by_row_and_col(self):
+        cells = [
+            gspread.cell.Cell(2, 1, "b1"),
+            gspread.cell.Cell(1, 2, "a2"),
+            gspread.cell.Cell(2, 3, "b3"),
+        ]
+        self.assertEqual(
+            utils.cell_list_to_row_map(cells),
+            {1: {2: "a2"}, 2: {1: "b1", 3: "b3"}},
+        )
+
+    def test_duplicate_coordinates_last_wins(self):
+        cells = [
+            gspread.cell.Cell(1, 1, "first"),
+            gspread.cell.Cell(1, 1, "last"),
+        ]
+        self.assertEqual(utils.cell_list_to_row_map(cells), {1: {1: "last"}})
+
+
+def _build_batch_update_body(row_map, prefix, blocks):
+    """Build the values.batchUpdate body for the given blocks, mirroring
+    Worksheet._update_cells_with_byte_limit."""
+    data = []
+    for start_row, start_col, end_row, end_col in blocks:
+        width = end_col - start_col + 1
+        values = []
+        for row in range(start_row, end_row + 1):
+            row_cells = row_map.get(row)
+            if row_cells is None:
+                values.append([None] * width)
+            else:
+                values.append(
+                    [row_cells.get(col) for col in range(start_col, end_col + 1)]
+                )
+        range_name = "{}{}:{}".format(
+            prefix,
+            utils.rowcol_to_a1(start_row, start_col),
+            utils.rowcol_to_a1(end_row, end_col),
+        )
+        data.append({"range": range_name, "values": values})
+    return {"valueInputOption": "RAW", "data": data}
+
+
+def _blocks_of_partition(rows, row_map, cuts):
+    blocks = []
+    prev = 0
+    for cut in list(cuts) + [len(rows)]:
+        seg_rows = rows[prev:cut]
+        cols = [c for r in seg_rows for c in row_map[r]]
+        blocks.append((seg_rows[0], min(cols), seg_rows[-1], max(cols)))
+        prev = cut
+    return blocks
+
+
+def _brute_force_best_blocks(row_map, prefix):
+    """Best split over all contiguous row partitions, measured on the real
+    compact-JSON request body, with the specified tie-breaking."""
+    import itertools
+
+    rows = sorted(row_map)
+    best_key = None
+    best_blocks = None
+    for k in range(len(rows)):
+        for cuts in itertools.combinations(range(1, len(rows)), k):
+            blocks = _blocks_of_partition(rows, row_map, cuts)
+            body = _build_batch_update_body(row_map, prefix, blocks)
+            size = len(utils.compact_json_dumps(body).encode("utf-8"))
+            key = (size, len(blocks), cuts)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_blocks = blocks
+    return best_blocks
+
+
+class OptimalUpdateBlocksTest(unittest.TestCase):
+    PREFIX = "'Sheet1'!"
+
+    def test_empty(self):
+        self.assertEqual(utils.optimal_update_blocks({}, self.PREFIX), [])
+
+    def test_single_cell(self):
+        self.assertEqual(
+            utils.optimal_update_blocks({4: {2: "x"}}, self.PREFIX),
+            [(4, 2, 4, 2)],
+        )
+
+    def test_contiguous_rows_merge_into_one_block(self):
+        row_map = {1: {1: "a"}, 2: {2: "b"}, 3: {1: "c"}}
+        self.assertEqual(
+            utils.optimal_update_blocks(row_map, self.PREFIX),
+            [(1, 1, 3, 2)],
+        )
+
+    def test_far_apart_rows_split(self):
+        row_map = {1: {1: "a"}, 100: {1: "b"}}
+        self.assertEqual(
+            utils.optimal_update_blocks(row_map, self.PREFIX),
+            [(1, 1, 1, 1), (100, 1, 100, 1)],
+        )
+
+    def test_distant_columns_split(self):
+        # merging rows 1 and 2 would span columns A..Z: two blocks are cheaper
+        row_map = {1: {1: "a"}, 2: {26: "b"}}
+        self.assertEqual(
+            utils.optimal_update_blocks(row_map, self.PREFIX),
+            [(1, 1, 1, 1), (2, 26, 2, 26)],
+        )
+
+    def test_tie_prefers_fewer_blocks(self):
+        # with this geometry one block and two blocks cost the same number
+        # of bytes: the single block must win
+        row_map = {1: {27: "x"}, 7: {27: "x"}}
+        self.assertEqual(
+            utils.optimal_update_blocks(row_map, "'T'!"),
+            [(1, 27, 7, 27)],
+        )
+
+    def test_tie_prefers_earliest_cut(self):
+        # cuts after row 1 and after row 3 both give the same minimal byte
+        # count with two blocks: the earlier cut must win
+        row_map = {1: {1: "x"}, 3: {2: "x"}, 5: {3: "x"}}
+        self.assertEqual(
+            utils.optimal_update_blocks(row_map, "'T'!"),
+            [(1, 1, 1, 1), (3, 2, 5, 3)],
+        )
+
+    def test_unicode_values_counted_as_utf8(self):
+        # "日本語" is 9 UTF-8 bytes: keeping both cells in one block costs
+        # less than splitting, the decision must use byte (not char) counts
+        row_map = {1: {1: "日本語"}, 3: {1: "日本語"}}
+        blocks = utils.optimal_update_blocks(row_map, self.PREFIX)
+        self.assertEqual(blocks, [(1, 1, 3, 1)])
+
+    def test_matches_brute_force(self):
+        """The solver must return the best split measured on the real
+        compact-JSON request body, with the specified tie-breaking."""
+        import random
+
+        rng = random.Random(20261120)
+        prefixes = ["'Sheet1'!", "'数据 表'!", "'A'!"]
+
+        for _ in range(300):
+            rows = sorted(rng.sample(range(1, 31), rng.randint(1, 7)))
+            row_map = {}
+            for row in rows:
+                row_map[row] = {}
+                for col in rng.sample(range(1, 9), rng.randint(1, 3)):
+                    row_map[row][col] = rng.choice(
+                        ["x", "hello", "", "日本語", 42, 1.5, None]
+                    )
+            prefix = rng.choice(prefixes)
+            self.assertEqual(
+                utils.optimal_update_blocks(row_map, prefix),
+                _brute_force_best_blocks(row_map, prefix),
+                msg="row_map={!r} prefix={!r}".format(row_map, prefix),
+            )
+
+    def test_column_label_length_matches_rowcol_to_a1(self):
+        for col in [1, 2, 25, 26, 27, 52, 53, 702, 703, 18278]:
+            self.assertEqual(
+                utils._column_label_length(col),
+                len(utils.rowcol_to_a1(1, col)) - 1,
+            )

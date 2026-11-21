@@ -51,7 +51,9 @@ from .utils import (
     absolute_range_name,
     cast_to_a1_notation,
     cell_list_to_rect,
+    cell_list_to_row_map,
     combined_merge_values,
+    compact_json_dumps,
     convert_colors_to_hex_value,
     convert_hex_to_colors_dict,
     fill_gaps,
@@ -60,6 +62,7 @@ from .utils import (
     get_a1_from_absolute_range,
     is_full_a1_notation,
     numericise_all,
+    optimal_update_blocks,
     rowcol_to_a1,
     to_records,
 )
@@ -770,6 +773,7 @@ class Worksheet:
         self,
         cell_list: List[Cell],
         value_input_option: ValueInputOption = ValueInputOption.raw,
+        max_bytes: Optional[int] = None,
     ) -> Mapping[str, Any]:
         """Updates many cells at once.
 
@@ -792,6 +796,21 @@ class Worksheet:
 
         :type value_input_option: :namedtuple:`~gspread.utils.ValueInputOption`
 
+        :param int max_bytes: (optional) Maximum size, in bytes, of the
+            request body sent to the API. When set, the involved rows are
+            split, from top to bottom, into contiguous blocks (a row is
+            never split) and each block is sent as its own range holding the
+            block's minimal bounding rectangle, in a single
+            ``values.batchUpdate`` request. Empty positions inside a block
+            are sent as ``null`` (skipped), empty strings still clear their
+            cell, and duplicate coordinates resolve to the last value. The
+            split minimizes the UTF-8 byte length of the request body,
+            measured and sent as compact JSON. If even the smallest possible
+            request body exceeds ``max_bytes``, a :exc:`ValueError` is
+            raised and no request is sent.
+
+            .. versionadded:: 6.3.0
+
         .. _ValueInputOption: https://developers.google.com/sheets/api/reference/rest/v4/ValueInputOption
 
         Example::
@@ -805,6 +824,11 @@ class Worksheet:
             # Update in batch
             worksheet.update_cells(cell_list)
         """
+        if max_bytes is not None:
+            return self._update_cells_with_byte_limit(
+                cell_list, value_input_option, max_bytes
+            )
+
         values_rect = cell_list_to_rect(cell_list)
 
         start = rowcol_to_a1(
@@ -822,6 +846,54 @@ class Worksheet:
         )
 
         return data
+
+    def _update_cells_with_byte_limit(
+        self,
+        cell_list: List[Cell],
+        value_input_option: ValueInputOption,
+        max_bytes: int,
+    ) -> Mapping[str, Any]:
+        """Implementation of :meth:`update_cells` with ``max_bytes`` set."""
+        row_map = cell_list_to_row_map(cell_list)
+        if not row_map:
+            raise ValueError("cell_list must contain at least one cell")
+
+        range_prefix = "{}!".format(absolute_range_name(self.title))
+        blocks = optimal_update_blocks(row_map, range_prefix)
+
+        data = []
+        for start_row, start_col, end_row, end_col in blocks:
+            width = end_col - start_col + 1
+            values = []
+            for row in range(start_row, end_row + 1):
+                row_cells = row_map.get(row)
+                if row_cells is None:
+                    values.append([None] * width)
+                else:
+                    values.append(
+                        [row_cells.get(col) for col in range(start_col, end_col + 1)]
+                    )
+            range_name = "{}{}:{}".format(
+                range_prefix,
+                rowcol_to_a1(start_row, start_col),
+                rowcol_to_a1(end_row, end_col),
+            )
+            data.append({"range": range_name, "values": values})
+
+        body = {"valueInputOption": value_input_option, "data": data}
+        payload = compact_json_dumps(body).encode("utf-8")
+
+        if len(payload) > max_bytes:
+            raise ValueError(
+                "Cannot update {} cells within max_bytes={}: the smallest "
+                "possible request body is {} bytes".format(
+                    sum(len(row_cells) for row_cells in row_map.values()),
+                    max_bytes,
+                    len(payload),
+                )
+            )
+
+        return self.client.values_batch_update_bytes(self.spreadsheet_id, payload)
 
     def get(
         self,
